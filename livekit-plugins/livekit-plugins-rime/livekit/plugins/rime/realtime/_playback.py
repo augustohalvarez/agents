@@ -205,9 +205,10 @@ class Playback:
             self._release(key)
 
 
-@dataclass
+@dataclass(eq=False)
 class _Segment:
     token: _Output | None
+    captured_segments_before: int
     samples: int = 0
     duration: float = 0
     sealed: bool = False
@@ -233,6 +234,7 @@ class PrismAudioOutput(AudioOutput):
         # before a callback can be associated with a retained segment.
         self._dropped_segments = 0
         self._flush_task: asyncio.Task[None] | None = None
+        self._flushing_segment: _Segment | None = None
         output.on("playback_finished", self._finished)
         output.on("playback_started", lambda ev: self.on_playback_started(created_at=ev.created_at))
         # Older released cores have no progress event. Event registration is still safe.
@@ -247,6 +249,7 @@ class PrismAudioOutput(AudioOutput):
         if self._flush_task is not None:
             await asyncio.shield(self._flush_task)
             self._flush_task = None
+            self._flushing_segment = None
         await super().capture_frame(frame)
         identity = frame.userdata.get(_KEY)
         token = identity.output if isinstance(identity, _Frame) else None
@@ -262,7 +265,7 @@ class PrismAudioOutput(AudioOutput):
             ):
                 token.invalid = True
         if self._segment is None:
-            self._segment = _Segment(token)
+            self._segment = _Segment(token, self._output.captured_playout_segments)
             if len(self._segments) >= 128:
                 self._dropped_segments += len(self._segments)
                 for segment in self._segments:
@@ -315,6 +318,7 @@ class PrismAudioOutput(AudioOutput):
         # The final resampler tail must be delivered before downstream flush.
         if self._resampler is not None:
             resampler, self._resampler = self._resampler, None
+            self._flushing_segment = segment
             task = self._flush_task = asyncio.create_task(self._flush_resampled(resampler, segment))
             task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
         else:
@@ -333,13 +337,27 @@ class PrismAudioOutput(AudioOutput):
             self.on_playback_finished(playback_position=0, interrupted=True)
 
     def clear_buffer(self) -> None:
-        if self._flush_task is not None:
-            self._flush_task.cancel()
-            self._flush_task = None
         for segment in self._segments:
             segment.invalid = True
             if segment.token is not None:
                 segment.token.invalid = True
+        if self._flush_task is not None:
+            if not self._flush_task.done():
+                self._flush_task.cancel()
+                flushing_segment = self._flushing_segment
+                if flushing_segment is not None and flushing_segment in self._segments:
+                    if (
+                        self._output.captured_playout_segments
+                        > flushing_segment.captured_segments_before
+                    ):
+                        # A cancelled tail still leaves its accepted segment open downstream.
+                        self._output.flush()
+                    else:
+                        # No downstream segment exists to report this interruption.
+                        self._segments.remove(flushing_segment)
+                        self.on_playback_finished(playback_position=0, interrupted=True)
+            self._flush_task = None
+            self._flushing_segment = None
         self._resampler = None
         self._output.clear_buffer()
 
@@ -374,6 +392,7 @@ class PrismAudioOutput(AudioOutput):
         if self._flush_task is not None:
             self._flush_task.cancel()
             self._flush_task = None
+            self._flushing_segment = None
         for segment in self._segments:
             if segment.token is not None:
                 segment.token.invalid = True

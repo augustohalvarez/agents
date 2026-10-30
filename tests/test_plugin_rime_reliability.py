@@ -919,6 +919,118 @@ async def test_roomio_wrapper_installs_before_opening_reply():
                 await room_io.aclose()
 
 
+@pytest.mark.parametrize("samples", [1, 2400])
+@pytest.mark.parametrize(
+    "phase", ["before_start", "before_capture", "after_capture", "after_flush"]
+)
+async def test_interrupted_resampler_flush_finishes_once_and_allows_next_segment(
+    samples, phase, monkeypatch
+):
+    """Interrupt real RoomIO with a resampler tail pending or already flushed."""
+    from livekit.agents.voice.room_io._output import _ParticipantAudioOutput
+    from livekit.plugins.rime.realtime._playback import PrismAudioOutput
+
+    sink = _ParticipantAudioOutput(
+        rtc.Room(),
+        sample_rate=48000,
+        num_channels=1,
+        track_publish_options=rtc.TrackPublishOptions(),
+    )
+    sink._subscribed_fut.set_result(None)
+    sink.pause()
+    wrapper = PrismAudioOutput(sink)
+    finished = []
+    wrapper.on("playback_finished", finished.append)
+    capture_started = asyncio.Event()
+    release_capture = asyncio.Event()
+    downstream_flushed = asyncio.Event()
+    capture = sink.capture_frame
+    flush = sink.flush
+    flushes = []
+
+    async def capture_tail(frame):
+        if phase == "after_capture":
+            await capture(frame)
+        capture_started.set()
+        await release_capture.wait()
+        if phase == "before_capture":
+            await capture(frame)
+
+    def record_flush():
+        flushes.append(None)
+        flush()
+        downstream_flushed.set()
+
+    try:
+        await wrapper.capture_frame(rtc.AudioFrame.create(24000, 1, samples))
+        if phase in ("before_capture", "after_capture"):
+            monkeypatch.setattr(sink, "capture_frame", capture_tail)
+        monkeypatch.setattr(sink, "flush", record_flush)
+        wrapper.flush()
+        if phase in ("before_capture", "after_capture"):
+            await asyncio.wait_for(capture_started.wait(), 1)
+        elif phase == "after_flush":
+            await asyncio.wait_for(downstream_flushed.wait(), 1)
+
+        accepted = sink.captured_playout_segments > 0
+        wrapper.clear_buffer()
+        wrapper.clear_buffer()
+        interrupted = await asyncio.wait_for(wrapper.wait_for_playout(), 1)
+        assert interrupted.interrupted
+        assert len(finished) == 1
+        assert len(flushes) == int(accepted)
+
+        monkeypatch.setattr(sink, "capture_frame", capture)
+        sink._forwarding_task = asyncio.create_task(sink._forward_audio())
+        sink.resume()
+        await wrapper.capture_frame(rtc.AudioFrame.create(24000, 1, 2400))
+        wrapper.flush()
+        completed = await asyncio.wait_for(wrapper.wait_for_playout(), 1)
+        assert not completed.interrupted
+        assert completed.playback_position == pytest.approx(0.1)
+        assert len(finished) == 2
+        assert len(flushes) == int(accepted) + 1
+    finally:
+        release_capture.set()
+        wrapper.on_detached()
+        await sink.aclose()
+
+
+@pytest.mark.parametrize("samples", [1, 2400])
+async def test_cancelled_resampler_tail_cannot_report_measured_completion(samples):
+    async with peer_model() as (peer, model, _):
+        sink = ControlledOutput(sample_rate=48000, synchronous=True)
+        wrapper = model.wrap_audio_output(sink)
+        provider = model.session()
+        await provider.update_instructions("test")
+
+        async def capture_response(seconds):
+            pending = provider.generate_reply()
+            response = await peer.start(await peer.next())
+            generation = await pending
+            await peer.message(response, seconds=seconds)
+            await peer.end(response)
+            message = await anext(generation.message_stream)
+            async for frame in message.audio_stream:
+                await wrapper.capture_frame(frame)
+            return response
+
+        await capture_response(samples / 24000)
+        wrapper.flush()
+        wrapper.clear_buffer()
+        await asyncio.wait_for(wrapper.wait_for_playout(), 1)
+        await asyncio.sleep(0)
+        assert peer.receipts.empty()
+
+        response = await capture_response(0.02)
+        wrapper.flush()
+        await asyncio.wait_for(wrapper.wait_for_playout(), 1)
+        receipt = await asyncio.wait_for(peer.receipts.get(), 3)
+        assert receipt["response_id"] == response
+        assert receipt["played_ms"] == pytest.approx(20)
+        assert peer.receipts.empty()
+
+
 @pytest.mark.parametrize("acknowledgment", [1, 2, 3, 4])
 async def test_new_reply_at_each_rebuild_acknowledgment_is_nonfatal(acknowledgment):
     async with peer_model() as (peer, model, _):
